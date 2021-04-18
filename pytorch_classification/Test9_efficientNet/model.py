@@ -16,6 +16,7 @@ def _make_divisible(ch, divisor=8, min_ch=None):
     It ensures that all layers have a channel number that is divisible by 8
     It can be seen here:
     https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    该函数的作用是将输入通道数调整到离它最近的8的整数倍，这样做以后对硬件更加友好。
     """
     if min_ch is None:
         min_ch = divisor
@@ -27,19 +28,22 @@ def _make_divisible(ch, divisor=8, min_ch=None):
 
 
 class ConvBNActivation(nn.Sequential):
+    """
+    模块名称：卷积BN激活函数模块
+    """
     def __init__(self,
-                 in_planes: int,
-                 out_planes: int,
+                 in_planes: int,   # 输入特征矩阵的channel
+                 out_planes: int,  # 输出特征矩阵的channel
                  kernel_size: int = 3,
                  stride: int = 1,
-                 groups: int = 1,
-                 norm_layer: Optional[Callable[..., nn.Module]] = None,
-                 activation_layer: Optional[Callable[..., nn.Module]] = None):
-        padding = (kernel_size - 1) // 2
+                 groups: int = 1,   # 用来控制当前的卷积是使用普通的卷积还是使用深度可分离卷积
+                 norm_layer: Optional[Callable[..., nn.Module]] = None,   # 是efficientnet中的边结构
+                 activation_layer: Optional[Callable[..., nn.Module]] = None):  # BN后面的激活函数
+        padding = (kernel_size - 1) // 2     # 根据kernel size 计算 padding
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         if activation_layer is None:
-            activation_layer = nn.SiLU  # alias Swish  (torch>=1.7)
+            activation_layer = nn.SiLU  # alias Swish  (torch>=1.7)   # SiLU激活函数和Swish激活函数是一样的，只是名称 不一样
 
         super(ConvBNActivation, self).__init__(nn.Conv2d(in_channels=in_planes,
                                                          out_channels=out_planes,
@@ -47,45 +51,51 @@ class ConvBNActivation(nn.Sequential):
                                                          stride=stride,
                                                          padding=padding,
                                                          groups=groups,
-                                                         bias=False),
-                                               norm_layer(out_planes),
+                                                         bias=False),   # 由于使用边结构，所以将bias设置为False
+                                               norm_layer(out_planes),  # norm_layer指的是边结构，它传入的参数是上一层特征矩阵输出的channel
                                                activation_layer())
 
 
 class SqueezeExcitation(nn.Module):
+    """
+    模块名称：SE模块
+    """
     def __init__(self,
                  input_c: int,   # block input channel
-                 expand_c: int,  # block expand channel
+                 expand_c: int,  # block expand channel  # 第一个1*1卷积升维后对应的channel
                  squeeze_factor: int = 4):
         super(SqueezeExcitation, self).__init__()
-        squeeze_c = input_c // squeeze_factor
-        self.fc1 = nn.Conv2d(expand_c, squeeze_c, 1)
+        squeeze_c = input_c // squeeze_factor    # 第一个全连接层结点个数
+        self.fc1 = nn.Conv2d(expand_c, squeeze_c, 1)   # kerenl size 1*1
         self.ac1 = nn.SiLU()  # alias Swish
         self.fc2 = nn.Conv2d(squeeze_c, expand_c, 1)
         self.ac2 = nn.Sigmoid()
 
     def forward(self, x: Tensor) -> Tensor:
-        scale = F.adaptive_avg_pool2d(x, output_size=(1, 1))
+        scale = F.adaptive_avg_pool2d(x, output_size=(1, 1))  # output_size=(1,1) 对每个channel进行全局平均池化
         scale = self.fc1(scale)
         scale = self.ac1(scale)
         scale = self.fc2(scale)
         scale = self.ac2(scale)
-        return scale * x
+        return scale * x   # scale代表每个输出channel的重要程度
 
 
 class InvertedResidualConfig:
+    """
+    对应每个MBConv模块的配置参数
+    """
     # kernel_size, in_channel, out_channel, exp_ratio, strides, use_SE, drop_connect_rate
     def __init__(self,
                  kernel: int,          # 3 or 5
-                 input_c: int,
-                 out_c: int,
+                 input_c: int,         # 输入MBConv模块的特征矩阵的channel
+                 out_c: int,           # MBConv模块输出的特征矩阵的channel
                  expanded_ratio: int,  # 1 or 6
-                 stride: int,          # 1 or 2
+                 stride: int,          # 1 or 2  dw卷积对应的步长
                  use_se: bool,         # True
-                 drop_rate: float,
-                 index: str,           # 1a, 2a, 2b, ...
-                 width_coefficient: float):
-        self.input_c = self.adjust_channels(input_c, width_coefficient)
+                 drop_rate: float,     # 对应MBConv模块的Dropout层
+                 index: str,           # 1a, 2a, 2b, ...  记录当前MBConv模块的名称
+                 width_coefficient: float):  # 网络宽度方向上的倍率因子
+        self.input_c = self.adjust_channels(input_c, width_coefficient)   # 真实的input_channel
         self.kernel = kernel
         self.expanded_c = self.input_c * expanded_ratio
         self.out_c = self.adjust_channels(out_c, width_coefficient)
@@ -100,20 +110,23 @@ class InvertedResidualConfig:
 
 
 class InvertedResidual(nn.Module):
+    """
+    模块名称：MBConv模块
+    """
     def __init__(self,
                  cnf: InvertedResidualConfig,
                  norm_layer: Callable[..., nn.Module]):
         super(InvertedResidual, self).__init__()
 
-        if cnf.stride not in [1, 2]:
+        if cnf.stride not in [1, 2]:  # 判断dw卷积的步长是否在1和2中
             raise ValueError("illegal stride value.")
 
-        self.use_res_connect = (cnf.stride == 1 and cnf.input_c == cnf.out_c)
+        self.use_res_connect = (cnf.stride == 1 and cnf.input_c == cnf.out_c)  # 判断是否是使用short cut连接
 
         layers = OrderedDict()
         activation_layer = nn.SiLU  # alias Swish
 
-        # expand
+        # expand  1*1 卷积模块
         if cnf.expanded_c != cnf.input_c:
             layers.update({"expand_conv": ConvBNActivation(cnf.input_c,
                                                            cnf.expanded_c,
@@ -121,7 +134,7 @@ class InvertedResidual(nn.Module):
                                                            norm_layer=norm_layer,
                                                            activation_layer=activation_layer)})
 
-        # depthwise
+        # depthwise dw卷积模块
         layers.update({"dwconv": ConvBNActivation(cnf.expanded_c,
                                                   cnf.expanded_c,
                                                   kernel_size=cnf.kernel,
@@ -130,18 +143,18 @@ class InvertedResidual(nn.Module):
                                                   norm_layer=norm_layer,
                                                   activation_layer=activation_layer)})
 
-        if cnf.use_se:
+        if cnf.use_se:  # 添加SE模块
             layers.update({"se": SqueezeExcitation(cnf.input_c,
                                                    cnf.expanded_c)})
 
-        # project
+        # project  搭建最后1*1的卷积层
         layers.update({"project_conv": ConvBNActivation(cnf.expanded_c,
                                                         cnf.out_c,
                                                         kernel_size=1,
                                                         norm_layer=norm_layer,
-                                                        activation_layer=nn.Identity)})
-
-        self.block = nn.Sequential(layers)
+                                                        activation_layer=nn.Identity)})  # 该模块没有激活函数，Identity的意思是不做任何处理
+ 
+        self.block = nn.Sequential(layers)   # 搭建MBConv模块的主分支
         self.out_channels = cnf.out_c
         self.is_strided = cnf.stride > 1
 
@@ -162,7 +175,7 @@ class InvertedResidual(nn.Module):
 
 class EfficientNet(nn.Module):
     def __init__(self,
-                 width_coefficient: float,
+                 width_coefficient: float,    
                  depth_coefficient: float,
                  num_classes: int = 1000,
                  dropout_rate: float = 0.2,
