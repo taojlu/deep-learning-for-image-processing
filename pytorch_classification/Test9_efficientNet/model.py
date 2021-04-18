@@ -175,18 +175,20 @@ class InvertedResidual(nn.Module):
 
 class EfficientNet(nn.Module):
     def __init__(self,
-                 width_coefficient: float,    
-                 depth_coefficient: float,
+                 width_coefficient: float,    # 代表channel维度上的倍率因子，比如在EfficientNetB0中Stage1的3*3卷积层所使用的卷积核个数是32，
+                                              #   那么在EfficientNetB6中就是32*1.8=57.6，接着取整到离它最近的8的证书倍即56，其它stage同理。
+                 depth_coefficient: float,      # 代表depth维度上的倍率因子（仅针对stage2到stage8), 比如在EfficientNetB0中stage7的L=4, 那么
+                                                # 在EfficientNetB6中就是4*2.6=10.4，接着向上取整即11。
                  num_classes: int = 1000,
-                 dropout_rate: float = 0.2,
-                 drop_connect_rate: float = 0.2,
-                 block: Optional[Callable[..., nn.Module]] = None,
-                 norm_layer: Optional[Callable[..., nn.Module]] = None
+                 dropout_rate: float = 0.2,   # 对应stage9, FC层前面的随机dropout比例
+                 drop_connect_rate: float = 0.2,   # 对应MBConv模块的随机缩放比例？是从0慢慢增长到0.2
+                 block: Optional[Callable[..., nn.Module]] = None, # MBConv模块
+                 norm_layer: Optional[Callable[..., nn.Module]] = None  # 对应普通的BN结构
                  ):
         super(EfficientNet, self).__init__()
 
-        # kernel_size, in_channel, out_channel, exp_ratio, strides, use_SE, drop_connect_rate, repeats
-        default_cnf = [[3, 32, 16, 1, 1, True, drop_connect_rate, 1],
+        # 针对B0 结构配置参数，只记录离stage2到stage8的参数。kernel_size, in_channel, out_channel, exp_ratio, strides, use_SE, drop_connect_rate, repeats
+        default_cnf = [[3, 32, 16, 1, 1, True, drop_connect_rate, 1],   # repeats 代表重复MBConv模块多少次。
                        [3, 16, 24, 6, 2, True, drop_connect_rate, 2],
                        [5, 24, 40, 6, 2, True, drop_connect_rate, 2],
                        [3, 40, 80, 6, 2, True, drop_connect_rate, 3],
@@ -199,10 +201,10 @@ class EfficientNet(nn.Module):
             return int(math.ceil(depth_coefficient * repeats))
 
         if block is None:
-            block = InvertedResidual
+            block = InvertedResidual   # MBConv模块
 
         if norm_layer is None:
-            norm_layer = partial(nn.BatchNorm2d, eps=1e-3, momentum=0.1)
+            norm_layer = partial(nn.BatchNorm2d, eps=1e-3, momentum=0.1)  # 其实是和BatchNorm2d是一样的，只是下次使用的时候不需要再传这两个参数。
 
         adjust_channels = partial(InvertedResidualConfig.adjust_channels,
                                   width_coefficient=width_coefficient)
@@ -211,13 +213,13 @@ class EfficientNet(nn.Module):
         bneck_conf = partial(InvertedResidualConfig,
                              width_coefficient=width_coefficient)
 
-        b = 0
-        num_blocks = float(sum(round_repeats(i[-1]) for i in default_cnf))
-        inverted_residual_setting = []
+        b = 0   # 用来统计搭建MNBconv模块的次数。
+        num_blocks = float(sum(round_repeats(i[-1]) for i in default_cnf))  # 获取当前网络所有MBConv模块的重复次数。
+        inverted_residual_setting = []   # 搭建所有MBConv模块的配置信息
         for stage, args in enumerate(default_cnf):
             cnf = copy.copy(args)
             for i in range(round_repeats(cnf.pop(-1))):
-                if i > 0:
+                if i > 0:   # 对应当前Stage的第一个模块
                     # strides equal 1 except first cnf
                     cnf[-3] = 1  # strides
                     cnf[1] = cnf[2]  # input_channel equal output_channel
@@ -237,25 +239,26 @@ class EfficientNet(nn.Module):
                                                      stride=2,
                                                      norm_layer=norm_layer)})
 
-        # building inverted residual blocks
+        # building inverted residual blocks，这个循环搭建出所有的MBConv结构。
         for cnf in inverted_residual_setting:
-            layers.update({cnf.index: block(cnf, norm_layer)})
+            layers.update({cnf.index: block(cnf, norm_layer)})  # index：模块名称，block: MBConv这个类。 视频第30分钟。
 
-        # build top
-        last_conv_input_c = inverted_residual_setting[-1].out_c
-        last_conv_output_c = adjust_channels(1280)
-        layers.update({"top": ConvBNActivation(in_planes=last_conv_input_c,
+        # build top   构建stage9
+        last_conv_input_c = inverted_residual_setting[-1].out_c  # 对应MBConv模块最后一个模块的输出channel.
+        last_conv_output_c = adjust_channels(1280)  # 进行宽度方向上的调整
+        layers.update({"top": ConvBNActivation(in_planes=last_conv_input_c,     # 构建1*1的卷积层。
                                                out_planes=last_conv_output_c,
                                                kernel_size=1,
                                                norm_layer=norm_layer)})
 
-        self.features = nn.Sequential(layers)
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-
+        self.features = nn.Sequential(layers)   # 实例化stage1到stage9的1*1卷积层。
+        self.avgpool = nn.AdaptiveAvgPool2d(1)  # 对应stage9的池化层。1 对应输出特征矩阵的高和宽都是1.
+         
+        # 定义分类器。
         classifier = []
-        if dropout_rate > 0:
+        if dropout_rate > 0: # 如果大于0， 则需要dropout层。
             classifier.append(nn.Dropout(p=dropout_rate, inplace=True))
-        classifier.append(nn.Linear(last_conv_output_c, num_classes))
+        classifier.append(nn.Linear(last_conv_output_c, num_classes))  # 添加最后的全连接层。为什么在最后全连接层前面还可以加一个dropout层？官方这样实现的。
         self.classifier = nn.Sequential(*classifier)
 
         # initial weights
